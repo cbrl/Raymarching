@@ -1,0 +1,164 @@
+#pragma kernel main
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "SDF.hlsl"
+
+Texture2D<float4> Source;
+RWTexture2D<float4> Destination;
+
+Texture2D<float4> _DepthTexture;
+
+uint     _ColorMode;
+float3   _HeatmapColor;
+float4x4 _CameraToWorldMatrix;
+float4x4 _ProjectionToCameraMatrix;
+float    _MinDistance;
+float    _MaxDistance;
+uint     _MaxIterations;
+float    _ShadowBias;
+float4   _ZBufferParams;
+
+static const float3 _LightDirection = normalize(float3(1, -1, -1));
+static const float  _LightIntensity = 3;
+
+StructuredBuffer<SDF> _Volumes;
+
+MarchingResult IterateVolumes(float3 rayOrigin)
+{
+    MarchingResult result;
+    result.distance      = _MaxDistance;
+    result.mat.baseColor = float3(1, 1, 1);
+    result.mat.metalness = 0.0f;
+    result.mat.roughness = 1.0f;
+
+    uint size, stride;
+    _Volumes.GetDimensions(size, stride);
+
+    for (uint i = 0; i < size; ++i)
+    {
+        _Volumes[i].Combine(rayOrigin, result);
+    }
+
+    return result;
+}
+
+float3 CalculateNormal(float3 p) {
+    float x = IterateVolumes(float3(p.x + _MinDistance, p.y, p.z)).distance - IterateVolumes(float3(p.x - _MinDistance, p.y, p.z)).distance;
+    float y = IterateVolumes(float3(p.x, p.y + _MinDistance, p.z)).distance - IterateVolumes(float3(p.x, p.y - _MinDistance, p.z)).distance;
+    float z = IterateVolumes(float3(p.x, p.y, p.z + _MinDistance)).distance - IterateVolumes(float3(p.x, p.y, p.z - _MinDistance)).distance;
+    return normalize(float3(x, y, z));
+}
+
+float CalculateShadow(float3 rayOrigin, float3 rayDirection, float dstToShadePoint) {
+    float rayDistance     = 0;
+    int   marchSteps      = 0;
+    float shadowIntensity = 0.2;
+    float brightness      = 1;
+
+    while (rayDistance < dstToShadePoint) {
+        marchSteps++;
+        float distance = IterateVolumes(rayOrigin).distance;
+
+        if (distance <= _MinDistance) {
+            return shadowIntensity;
+        }
+
+        brightness = min(brightness, distance * 200);
+
+        rayOrigin   += rayDirection * distance;
+        rayDistance += distance;
+    }
+
+    return shadowIntensity + (1 - shadowIntensity) * brightness;
+}
+
+float3 GetF0(Material mat) {
+    // 0.04f = dielectric constant for metalness workflow (IOR of approx. 1.5)
+    return lerp(0.04f, mat.baseColor.xyz, mat.metalness);
+}
+
+void Lambert(float3 l, float3 n, float3 v, Material mat, out float3 diffuse, out float3 specular) {
+    const float invPi = 0.31830988618;
+    diffuse  = (1.0f - mat.metalness) * mat.baseColor.xyz * invPi;
+    specular = float3(0.0f, 0.0f, 0.0f);
+}
+
+void BlinnPhong(float3 l, float3 n, float3 v, Material mat, out float3 diffuse, out float3 specular) {
+    Lambert(l, n, v, mat, diffuse, specular);
+
+    const float3 h     = normalize(l + v);
+    const float  NdotH = max(dot(n, h), 0.0f);
+    const float  power = exp2((1.0f - mat.roughness) * 10.0f); //roughness[1, 0] -> exponent[0, 1024]
+    specular = GetF0(mat) * pow(NdotH, power);
+}
+
+float4 BRDF(float3 surfacePoint, float3 normal, float3 surfaceToCam, float3 lightDir, Material mat)
+{
+    // Blinn-Phong lighting
+    float3 diffuse;
+    float3 specular;
+    BlinnPhong(lightDir, normal, surfaceToCam, mat, diffuse, specular);
+
+    // Shadow
+    float3 offsetPos    = surfacePoint + (normal * _ShadowBias);
+    float  shadowFactor = CalculateShadow(offsetPos, lightDir, _MaxDistance);
+
+    float3 radiance = (diffuse + specular) * _LightIntensity * shadowFactor * saturate(dot(normal, lightDir));
+    return float4(radiance, 1);
+}
+
+float4 raymarching(float3 rayOrigin, float3 rayDirection, float2 texcoord)
+{
+    float rayDistance = 0;
+    uint  marchSteps  = 0;
+
+    float depth    = _DepthTexture[texcoord].r;
+    float eyeDepth = LinearEyeDepth(depth, _ZBufferParams);
+    float maxDepth = min(_MaxDistance, eyeDepth);
+
+    while ((rayDistance <= maxDepth) && (marchSteps <= _MaxIterations))
+    {
+        MarchingResult result = IterateVolumes(rayOrigin);
+        marchSteps++;
+
+        if (result.distance <= _MinDistance)
+        {
+            if (_ColorMode == 0) //BRDF
+            {
+                float3 surfacePoint = rayOrigin + (rayDirection * result.distance);
+                float3 normal = CalculateNormal(surfacePoint - (rayDirection * _MinDistance));
+                float3 lightDir = -_LightDirection;
+                float3 surfaceToCam = normalize(rayOrigin - surfacePoint);
+
+                return BRDF(surfacePoint, normal, surfaceToCam, lightDir, result.mat);
+            }
+            else if (_ColorMode == 1) //Heatmap
+            {
+                float value = ((float)marchSteps) / _MaxIterations;
+                return float4(_HeatmapColor, 1) * value;
+            }
+            else break;
+        }
+
+        rayOrigin   += rayDirection * result.distance;
+        rayDistance += result.distance;
+    }
+
+    return Source[texcoord];
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint width;
+    uint height;
+    Destination.GetDimensions(width, height);
+
+    float2 screenCoord  = ((id.xy / float2(width, height)) * 2) - 1;
+    float3 rayOrigin    = mul(_CameraToWorldMatrix, float4(0, 0, 0, 1)).xyz;
+    float3 rayDirection = mul(_ProjectionToCameraMatrix, float4(screenCoord, 0, 1)).xyz;
+    rayDirection = mul(_CameraToWorldMatrix, float4(rayDirection, 0)).xyz;
+    rayDirection = normalize(rayDirection);
+
+    Destination[id.xy] = raymarching(rayOrigin, rayDirection, id.xy);
+}
